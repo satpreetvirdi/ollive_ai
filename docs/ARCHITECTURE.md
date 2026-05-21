@@ -1,102 +1,94 @@
-# Architecture Notes
+# Architecture notes
 
-## Ingestion flow (event-driven)
+This document explains how I wired the system together — ingestion path, logging choices, how I'd scale it, and what happens when things break.
 
-1. User sends a message via the React UI to the **Chat API**.
-2. Chat API persists the user message in PostgreSQL.
-3. Chat API invokes the LLM through the **Inference SDK** `wrap()` or streaming path.
-4. SDK emits a `pending` log immediately, then a final log (`success`, `error`, or `cancelled`).
-5. SDK **POSTs** to **Ingestion API** `POST /v1/inference-logs` (fire-and-forget, ~3s timeout, retries).
-6. Ingestion API **validates** (Pydantic) and **enqueues** the payload to **Redis Stream** `inference:logs` → returns **HTTP 202**.
-7. **Ingestion worker** (`worker.py`) consumes from the stream (consumer group `ingestion-workers`) and **upserts** into `inference_logs`.
-8. Dashboard reads aggregates via `GET /v1/metrics/summary` (SQL over persisted rows).
+---
 
-```mermaid
-sequenceDiagram
-    participant UI as Web UI
-    participant Chat as Chat API
-    participant SDK as Inference SDK
-    participant LLM as Groq
-    participant Ing as Ingestion API
-    participant Redis as Redis Stream
-    participant Worker as Ingestion Worker
-    participant DB as PostgreSQL
+## Ingestion flow
 
-    UI->>Chat: POST /chat
-    Chat->>DB: INSERT user message
-    Chat->>SDK: logPending / stream
-    SDK->>Ing: POST inference log
-    Ing->>Redis: XADD inference:logs
-    Ing-->>SDK: 202 Accepted
-    Worker->>Redis: XREADGROUP
-    Worker->>DB: UPSERT inference_logs
-    Worker->>Redis: XACK
-    Chat->>LLM: completion
-    SDK->>Ing: POST final log
-    Ing->>Redis: XADD
-    Worker->>DB: UPSERT
-```
+Here's what happens when you send a message in my UI.
 
-## Why event-based ingestion?
+The chat API saves your message to `messages` first. Then it loads recent history (I cap it with `MAX_CONTEXT_MESSAGES`), picks the provider from the dropdown, and calls the model.
 
-| Benefit | How |
-|---------|-----|
-| **Decouple write path** | HTTP handler only validates + enqueues (~ms), not DB-bound |
-| **Absorb spikes** | Redis buffers if Postgres is slow |
-| **Scale workers** | Run multiple `ingestion-worker` containers with same consumer group |
-| **Resilience** | Unacked messages stay in pending; worker retries on failure |
+Right before the LLM runs, my SDK fires a log with `status: pending`. That HTTP call goes to `POST /v1/inference-logs` on the ingestion service. I validate the body with Pydantic, push JSON onto a Redis stream (`inference:logs`), and return **202**. I deliberately do **not** touch Postgres in that request — it keeps the handler fast.
 
-Set `USE_EVENT_QUEUE=false` to fall back to synchronous DB write in the API (useful for local debugging without Redis).
+A separate process (`worker.py`) reads the stream and upserts into `inference_logs`. When the model finishes, the SDK sends a second log (`success`, `error`, or `cancelled`) with the same `log_id`, so the row gets updated instead of duplicated.
+
+Streaming works the same way: chunks go to the browser over SSE, and the final log lands after the stream completes.
+
+Chat content and inference logs are separate tables. If logging fails, you still get a normal conversation in `messages` — I cared more about chat working than perfect observability.
+
+The frontend never talks to ingestion directly. Only the chat API → SDK → ingestion path runs inside the backend.
+
+---
 
 ## Logging strategy
 
-- **Two-phase logs**: `pending` at request start, final status on completion.
-- **Non-blocking**: SDK `sendAsync()` never blocks chat.
-- **Previews only**: truncated + PII redaction in `redact.ts`.
-- **Degraded mode**: if Redis or ingestion is down, SDK warns; chat continues.
+I wrapped every LLM call in `packages/inference-sdk` (`InferenceLogger`).
+
+Each inference gets a UUID (`log_id`). I emit two events when possible: one at start (`pending`), one at the end. That way I can compute latency even if something dies mid-request.
+
+I send logs with `sendAsync` — the chat handler doesn't await Postgres. The client retries a couple of times, then logs `[inference-sdk] log delivery failed` and continues. I chose that so a slow or broken ingestion service wouldn't block replies.
+
+I only persist **previews** (truncated text), with regex redaction for emails, phone-like numbers, etc. in `redact.ts`. Full prompts would be more useful for debugging but worse for privacy and storage; the assignment spec pointed at previews anyway.
+
+Fields I capture: provider, model, token usage, timestamps, conversation/message/session ids, status, error info, plus optional `raw_metadata` jsonb for extras.
+
+---
 
 ## Scaling considerations
 
-- **Chat API** and **Ingestion API** scale horizontally (stateless).
-- **Workers** scale horizontally (same Redis consumer group; messages partition across consumers).
-- **Redis**: Redis Cluster / managed Redis for HA; monitor stream length and pending count.
-- **PostgreSQL**: connection pooling; read replica for dashboards.
-- **Batch endpoint** (future): `POST /v1/inference-logs/batch` publishing multiple XADDs.
+**Chat API** and **ingestion HTTP** are stateless — I'd scale them behind a load balancer and point them at the same Postgres + Redis.
+
+**Ingestion workers** can run multiple replicas. They share one Redis consumer group (`ingestion-workers`), so each message goes to one worker. I'd watch DB connection count if I scaled workers hard.
+
+**Redis** absorbs write spikes. If workers lag, the stream grows — I'd monitor length and pending entries. For production I'd use managed Redis, not a single container like in my compose file.
+
+**Postgres** is the long-term limit. I'd add pooling (PgBouncer) with many chat replicas, maybe a read replica for dashboard queries, and eventually partition `inference_logs` by time.
+
+I skipped a batch ingest API. Fine for interactive chat; I'd add it if a client needed to ship offline logs in bulk.
+
+---
 
 ## Failure handling assumptions
 
-| Failure | Behavior |
-|---------|----------|
-| Redis down | Ingestion returns **503**; SDK retries then warns |
-| Worker down | Logs accumulate in stream; processed when worker returns |
-| Worker DB error | Message **not ACKed**; redelivered to consumer group |
-| Invalid payload | API returns **422** before enqueue |
-| Duplicate `log_id` | Upsert on persist — idempotent |
-| Ingestion unreachable | Chat unaffected |
+These are the behaviors I implemented and expect in this demo setup.
 
-## Component responsibilities
+**Ingestion or Redis unavailable** — SDK retries, then stops. Chat still responds. Those turns won't show up in `inference_logs`.
 
-| Component | Language | Role |
-|-----------|----------|------|
-| `packages/inference-sdk` | TypeScript | Wrap LLM calls, POST logs to ingestion |
-| `apps/chat-api` | Node.js | Chat, providers, SDK integration |
-| `apps/ingestion-api` | Python | HTTP validate + Redis enqueue |
-| `apps/ingestion-api/worker.py` | Python | Redis consumer → Postgres |
-| `apps/ingestion-api/events/redis_queue.py` | Python | Stream publish/consume/ack |
-| `apps/web` | React | UI + dashboard |
-| `redis` (Docker) | — | Event bus |
-| `db/init.sql` | SQL | Schema |
+**Worker stopped** — ingestion still accepts logs into Redis. They sit in the stream until the worker comes back.
+
+**Worker can't write to Postgres** — I don't ACK the Redis message, so it can be retried. I didn't build a dead-letter queue.
+
+**Invalid JSON / validation error** — 4xx from ingestion, nothing enqueued.
+
+**Duplicate `log_id`** — upsert, so SDK retries are safe.
+
+**Cancel in the UI** — I abort the in-flight LLM request, log `cancelled`, and mark the conversation cancelled in the API.
+
+**Missing provider API key** — 400 from chat with a readable error.
+
+**Security** — I assumed a trusted dev network. Internal traffic isn't TLS-terminated in compose, and there's no rate limiting.
+
+---
 
 ## Multi-provider
 
-| Provider | File | API |
-|----------|------|-----|
-| Groq | `groq.ts` | OpenAI-compatible |
-| OpenAI | `openai.ts` | OpenAI-compatible |
-| Gemini | `gemini.ts` | `@google/generative-ai` |
-| Anthropic | `anthropic.ts` | `@anthropic-ai/sdk` |
+I put Groq, OpenAI, Gemini, and Anthropic behind one `LLMProvider` interface in `apps/chat-api/src/providers/`. Groq and OpenAI share an OpenAI-compatible client; Gemini and Anthropic use their own SDKs.
 
-- Registry: `providers/registry.ts` — env keys and default models.
-- Factory: `createProvider(providerId?, model?)` — used by chat route; validates API key.
-- UI: `GET /api/providers` + dropdown; each message sends `{ provider: "gemini" }`.
-- Inference logs record actual `provider` + `model` per request ( comparable in dashboard / DBeaver ).
+The UI calls `GET /api/providers` to show which keys I actually configured in env. Each inference log row records the real `provider` and `model` for that request so I can compare them in SQL or on the dashboard.
+
+---
+
+## Code map
+
+| Piece | Path |
+|-------|------|
+| SDK | `packages/inference-sdk` |
+| Chat + providers | `apps/chat-api` |
+| Ingestion + worker | `apps/ingestion-api` |
+| UI | `apps/web` |
+| Schema | `db/init.sql` |
+| Kubernetes | `k8s/base`, `k8s/overlays/local` |
+
+If you want synchronous ingestion (no Redis/worker) for debugging, set `USE_EVENT_QUEUE=false` on the ingestion API — it writes Postgres directly in the POST handler.
