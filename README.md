@@ -34,7 +34,7 @@ Quick map so you don't have to dig through the repo to check coverage.
 | GitHub repo with source | This repository |
 | README: setup, architecture, schema, tradeoffs, future work | Below + [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) |
 | Architecture notes: ingestion, logging, scaling, failures | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) |
-| Demo (hosted link, screenshots, or Loom) | Docker / K8s locally; optional tunnel — [docs/SHAREABLE-DEMO.md](docs/SHAREABLE-DEMO.md) |
+
 
 ### Bonus (from the job post)
 
@@ -53,13 +53,7 @@ Quick map so you don't have to dig through the repo to check coverage.
 
 ---
 
-## Setup
 
-### Docker Compose (what I'd use to review this)
-
-```bash
-cp .env.example .env
-```
 
 Add your `GROQ_API_KEY` in `.env`. I defaulted to Groq because the free tier works without a credit card; you can switch to OpenAI with `LLM_PROVIDER=openai` and `OPENAI_API_KEY` if you prefer.
 
@@ -193,5 +187,4 @@ I added streaming (SSE), list/resume/cancel for conversations, a small metrics d
 ## Demo
 
 - **Architecture details:** [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)  
-- **K8s:** [docs/KUBERNETES.md](docs/KUBERNETES.md)  
-- **Temporary public URL:** [docs/SHAREABLE-DEMO.md](docs/SHAREABLE-DEMO.md) (tunnel to local NodePort — only up while my machine/cluster is running)  
+  
