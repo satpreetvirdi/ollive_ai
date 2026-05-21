@@ -1,0 +1,42 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ingestion-worker
+  namespace: olliveai
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ingestion-worker
+  template:
+    metadata:
+      labels:
+        app: ingestion-worker
+    spec:
+      initContainers:
+        - name: wait-postgres
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - until nc -z postgres 5432; do sleep 2; done
+        - name: wait-redis
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - until nc -z redis 6379; do sleep 2; done
+      containers:
+        - name: worker
+          image: olliveai/ingestion-api:latest
+          imagePullPolicy: IfNotPresent
+          command: ["python", "worker.py"]
+          envFrom:
+            - configMapRef:
+                name: olliveai-config
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: olliveai-secrets
+                  key: DATABASE_URL

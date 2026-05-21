@@ -1,0 +1,97 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ollive
+      POSTGRES_PASSWORD: ollive
+      POSTGRES_DB: olliveai
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ollive -d olliveai"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  ingestion-api:
+    build:
+      context: ./apps/ingestion-api
+    ports:
+      - "8001:8001"
+    environment:
+      DATABASE_URL: postgresql://ollive:ollive@postgres:5432/olliveai
+      REDIS_URL: redis://redis:6379/0
+      USE_EVENT_QUEUE: "true"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  ingestion-worker:
+    build:
+      context: ./apps/ingestion-api
+    command: ["python", "worker.py"]
+    environment:
+      DATABASE_URL: postgresql://ollive:ollive@postgres:5432/olliveai
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ingestion-api:
+        condition: service_started
+    restart: unless-stopped
+
+  chat-api:
+    build:
+      context: .
+      dockerfile: apps/chat-api/Dockerfile
+    ports:
+      - "3001:3001"
+    environment:
+      DATABASE_URL: postgresql://ollive:ollive@postgres:5432/olliveai
+      INGESTION_URL: http://ingestion-api:8001
+      LLM_PROVIDER: ${LLM_PROVIDER:-groq}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GROQ_MODEL: ${GROQ_MODEL:-llama-3.1-8b-instant}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.0-flash}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-3-5-haiku-20241022}
+      PORT: "3001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ingestion-api:
+        condition: service_started
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+      args:
+        VITE_API_URL: http://localhost:3001
+    ports:
+      - "5173:5173"
+    depends_on:
+      - chat-api
+
+volumes:
+  postgres_data:

@@ -1,0 +1,85 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: chat-api
+  namespace: olliveai
+spec:
+  ports:
+    - port: 3001
+      targetPort: 3001
+  selector:
+    app: chat-api
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chat-api
+  namespace: olliveai
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: chat-api
+  template:
+    metadata:
+      labels:
+        app: chat-api
+    spec:
+      initContainers:
+        - name: wait-postgres
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - until nc -z postgres 5432; do sleep 2; done
+        - name: wait-ingestion
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - until nc -z ingestion-api 8001; do sleep 2; done
+      containers:
+        - name: chat-api
+          image: olliveai/chat-api:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 3001
+          envFrom:
+            - configMapRef:
+                name: olliveai-config
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: olliveai-secrets
+                  key: DATABASE_URL
+            - name: GROQ_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: olliveai-secrets
+                  key: GROQ_API_KEY
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: olliveai-secrets
+                  key: OPENAI_API_KEY
+            - name: GEMINI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: olliveai-secrets
+                  key: GEMINI_API_KEY
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: olliveai-secrets
+                  key: ANTHROPIC_API_KEY
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3001
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3001
+            periodSeconds: 15

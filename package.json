@@ -1,0 +1,15 @@
+{
+  "name": "olliveai",
+  "private": true,
+  "version": "1.0.0",
+  "description": "LLM inference logging and ingestion system",
+  "scripts": {
+    "dev": "pnpm run --parallel dev",
+    "build": "pnpm run -r build",
+    "chat-api": "pnpm --filter @olliveai/chat-api dev",
+    "web": "pnpm --filter @olliveai/web dev"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

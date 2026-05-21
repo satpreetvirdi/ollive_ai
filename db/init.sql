@@ -1,0 +1,65 @@
+-- Conversations
+CREATE TABLE IF NOT EXISTS conversations (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    title VARCHAR(255),
+    status VARCHAR(32) NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active', 'cancelled', 'archived')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Chat messages
+CREATE TABLE IF NOT EXISTS messages (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    conversation_id UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    role VARCHAR(16) NOT NULL CHECK (role IN ('user', 'assistant', 'system')),
+    content TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_messages_conversation_id ON messages(conversation_id);
+CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at);
+
+-- Inference logs from SDK
+CREATE TABLE IF NOT EXISTS inference_logs (
+    id UUID PRIMARY KEY,
+    conversation_id UUID REFERENCES conversations(id) ON DELETE SET NULL,
+    message_id UUID REFERENCES messages(id) ON DELETE SET NULL,
+    session_id VARCHAR(128),
+    provider VARCHAR(64) NOT NULL,
+    model VARCHAR(128) NOT NULL,
+    status VARCHAR(32) NOT NULL
+        CHECK (status IN ('pending', 'success', 'error', 'cancelled')),
+    latency_ms INTEGER,
+    prompt_tokens INTEGER,
+    completion_tokens INTEGER,
+    total_tokens INTEGER,
+    error_code VARCHAR(64),
+    error_message TEXT,
+    input_preview TEXT,
+    output_preview TEXT,
+    request_started_at TIMESTAMPTZ NOT NULL,
+    request_completed_at TIMESTAMPTZ,
+    raw_metadata JSONB DEFAULT '{}',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_inference_logs_conversation_id ON inference_logs(conversation_id);
+CREATE INDEX IF NOT EXISTS idx_inference_logs_created_at ON inference_logs(created_at);
+CREATE INDEX IF NOT EXISTS idx_inference_logs_status ON inference_logs(status);
+CREATE INDEX IF NOT EXISTS idx_inference_logs_provider ON inference_logs(provider);
+
+-- Trigger: update conversation.updated_at on new message
+CREATE OR REPLACE FUNCTION update_conversation_timestamp()
+RETURNS TRIGGER AS $$
+BEGIN
+    UPDATE conversations SET updated_at = NOW() WHERE id = NEW.conversation_id;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_messages_update_conversation ON messages;
+CREATE TRIGGER trg_messages_update_conversation
+    AFTER INSERT ON messages
+    FOR EACH ROW
+    EXECUTE FUNCTION update_conversation_timestamp();
